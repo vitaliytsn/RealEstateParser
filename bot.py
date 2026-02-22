@@ -360,8 +360,9 @@ async def send_next_page(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["offset"] = offset + len(results)
 
     if sent_any:
+        # CHANGED: use visible text so inline keyboard ALWAYS appears
         await message.reply_text(
-            INVISIBLE_TEXT,
+            "⬇️",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё", callback_data="more_results")]]),
         )
     else:
@@ -422,7 +423,6 @@ async def send_apartment_variant_a(message, apt: dict) -> bool:
 
     text = format_apartment(apt)
 
-    # Wide button: single button in a single row
     select_markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("✅ Выбрать объявление", callback_data=f"select_{apt['ad_id']}")]]
     )
@@ -441,14 +441,13 @@ async def send_apartment_variant_a(message, apt: dict) -> bool:
             await message.reply_photo(photo=photos[0], caption=text[:1000])
     except Exception as e:
         logger.error(f"Send media error (ad_id={apt.get('ad_id')}): {e}")
-        # fallback: show text + button
         await message.reply_text(text)
-        await message.reply_text(INVISIBLE_TEXT, reply_markup=select_markup)
+        await message.reply_text("✅", reply_markup=select_markup)
         return True
 
-    # 2) Button only message (invisible text)
+    # 2) CHANGED: use visible text so inline keyboard ALWAYS appears
     try:
-        await message.reply_text(INVISIBLE_TEXT, reply_markup=select_markup)
+        await message.reply_text("✅", reply_markup=select_markup)
     except Exception as e:
         logger.error(f"Send button error (ad_id={apt.get('ad_id')}): {e}")
 
@@ -465,7 +464,6 @@ async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ad_id = None
     context.user_data["selected_ad_id"] = ad_id
 
-    # Ask contact method
     markup = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Telegram", callback_data="lead_tg")],
@@ -488,7 +486,6 @@ async def lead_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.edit_message_text("✅ Принято! Наш консультант свяжется с вами в течение 30 минут.")
         return ConversationHandler.END
 
-    # phone: request contact button (no manual typing)
     kb = ReplyKeyboardMarkup(
         [[KeyboardButton("📞 Отправить номер", request_contact=True)]],
         resize_keyboard=True,
@@ -531,7 +528,6 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # Search flow
     search_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -543,10 +539,8 @@ def main():
     )
     app.add_handler(search_conv)
 
-    # Pagination
     app.add_handler(CallbackQueryHandler(more_results, pattern=r"^more_results$"))
 
-    # Lead flow
     lead_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(select_apartment, pattern=r"^select_")],
         states={
