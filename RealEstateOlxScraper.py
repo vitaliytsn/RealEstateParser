@@ -6,17 +6,21 @@ import sqlite3
 import time
 from datetime import datetime
 from urllib.parse import urljoin
+import os
 
 # --- Database Setup ---
-DB_NAME = "otodom_ads.db"
+DB_NAME = os.getenv("DB_PATH", "otodom_ads.db")
 
 OLX_LIST_URL = "https://www.olx.pl/nieruchomosci/mieszkania/wynajem/warszawa/?search%5Border%5D=created_at:desc"
 OLX_BASE = "https://www.olx.pl"
 
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    cursor.execute("PRAGMA busy_timeout=30000;")
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS ads (
             ad_id INTEGER PRIMARY KEY,
@@ -38,8 +42,9 @@ def init_db():
 
 
 def is_ad_new(ad_id: int) -> bool:
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA busy_timeout=30000;")
     cursor.execute("SELECT 1 FROM ads WHERE ad_id = ?", (ad_id,))
     exists = cursor.fetchone()
     conn.close()
@@ -47,8 +52,9 @@ def is_ad_new(ad_id: int) -> bool:
 
 
 def save_ad(ad: dict):
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA busy_timeout=30000;")
     try:
         cursor.execute('''
             INSERT INTO ads (ad_id, title, price, area, rooms, city, province, district, street, details_url, photos, first_seen)
@@ -90,26 +96,60 @@ def http_get(url: str):
         "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
         "Referer": "https://www.olx.pl/",
     }
-    return requests.get(url, headers=headers, timeout=20)
+    return requests.get(url, headers=headers, timeout=20, allow_redirects=True)
 
 
 def extract_area_from_card(card) -> float | None:
     """
-    В OLX карточке квадратура выглядит как '36 m²'
-    Она обычно находится в span рядом с svg blueprint.
-    Если квадратуры нет — это часто реклама/услуги, и мы будем такие объявления скипать.
+    Robust parsing (no :has selector): find '36 m²' anywhere in card text.
+    If no area — often a promoted service ad, we skip it.
     """
-    # Пытаемся найти span, в котором есть blueprint icon
-    span = card.select_one('span:has(svg[data-testid="blueprint-card-param-icon"])')
-    if not span:
-        return None
-
-    txt = span.get_text(" ", strip=True).replace("\xa0", " ")
+    txt = card.get_text(" ", strip=True).replace("\xa0", " ")
     mm = re.search(r"(\d+(?:[.,]\d+)?)\s*m²", txt)
     if not mm:
         return None
-
     return float(mm.group(1).replace(",", "."))
+
+
+NUM_TO_TEXT_ROOMS = {
+    "1": "ONE",
+    "2": "TWO",
+    "3": "THREE",
+    "4": "FOUR",
+    "5": "FIVE",
+    "6": "SIX",
+    "7": "SEVEN",
+    "8": "EIGHT",
+    "9": "NINE",
+    "10": "TEN",
+}
+
+
+def normalize_price_to_pln(price_text: str) -> str:
+    """Convert OLX price like '3 000 zł' to '3000 PLN' (bot expects PLN + digits)."""
+    if not price_text:
+        return "N/A"
+    txt = price_text.replace("\xa0", " ").strip()
+    digits = re.sub(r"[^0-9 ,.]", "", txt)
+    digits = digits.replace(" ", "")
+    if not digits:
+        return "N/A"
+    digits = digits.split(",")[0].split(".")[0]
+    try:
+        value = int(digits)
+        return f"{value} PLN"
+    except Exception:
+        return "N/A"
+
+
+def normalize_rooms_to_text(rooms_raw: str | None) -> str:
+    """Convert OLX rooms like '2 pokoje' or '2' -> 'TWO' to match Otodom format used by the bot."""
+    if not rooms_raw:
+        return "N/A"
+    mm = re.search(r"(\d+)", str(rooms_raw))
+    if not mm:
+        return "N/A"
+    return NUM_TO_TEXT_ROOMS.get(mm.group(1), "N/A")
 
 
 # --- OLX List Parser ---
@@ -125,6 +165,7 @@ def parse_olx_list(list_url: str):
 
     soup = BeautifulSoup(r.text, "html.parser")
     cards = soup.select('div[data-cy="l-card"][id]')
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Found {len(cards)} cards on OLX listing page")
     new_ads = []
 
     for card in cards:
@@ -132,7 +173,7 @@ def parse_olx_list(list_url: str):
         if not raw_id:
             continue
 
-        # ✅ ФИЛЬТР 1: пропускаем рекламу/услуги (нет квадратуры)
+        # ✅ FILTER 1: skip ads without area (often services/promotions)
         area = extract_area_from_card(card)
         if area is None:
             continue
@@ -141,7 +182,7 @@ def parse_olx_list(list_url: str):
         if ad_id == 0:
             continue
 
-        # ✅ ФИЛЬТР 2: только новые объявления (не лезем в details для старых)
+        # ✅ FILTER 2: only new ads (don't open details for old)
         if not is_ad_new(ad_id):
             continue
 
@@ -152,6 +193,7 @@ def parse_olx_list(list_url: str):
         # price
         price_el = card.select_one('[data-testid="ad-price"]')
         price = price_el.get_text(" ", strip=True).replace("\xa0", " ") if price_el else "N/A"
+        price = normalize_price_to_pln(price)
 
         # details url
         link_el = card.select_one('a[href*="/d/oferta/"]')
@@ -169,7 +211,7 @@ def parse_olx_list(list_url: str):
             if mm:
                 district = mm.group(1).strip()
 
-        # preview photo 
+        # preview photo
         photos = []
         img_el = card.select_one("img[src*='apollo.olxcdn.com']")
         if img_el and img_el.get("src"):
@@ -180,7 +222,7 @@ def parse_olx_list(list_url: str):
             "title": title,
             "price": price,
             "area": area,
-            "rooms": "N/A",      
+            "rooms": "N/A",
             "city": "Warszawa",
             "province": "mazowieckie",
             "district": district,
@@ -224,9 +266,10 @@ def parse_olx_details(details_url: str):
         mm = re.search(r"(\d+)", params["Liczba pokoi"])
         if mm:
             rooms = mm.group(1)
+    rooms = normalize_rooms_to_text(rooms)
     result["rooms"] = rooms
 
-    # area (на всякий случай перепроверим)
+    # area
     area = None
     if isinstance(params.get("Powierzchnia"), str):
         mm = re.search(r"(\d+(?:[.,]\d+)?)\s*m²", params["Powierzchnia"])
@@ -258,11 +301,9 @@ def run_task():
     for ad in new_ads:
         details = parse_olx_details(ad["details_url"])
 
-        # merge details
         if details.get("rooms"):
             ad["rooms"] = details["rooms"]
 
-        # area from list already, but if details has it — overwrite with more reliable
         if details.get("area") is not None:
             ad["area"] = details["area"]
 
