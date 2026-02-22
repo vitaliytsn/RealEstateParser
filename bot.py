@@ -5,13 +5,23 @@ import json
 import re
 from typing import Any
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
     ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 # ----------------- Logging -----------------
@@ -24,8 +34,11 @@ logger = logging.getLogger(__name__)
 # ----------------- Config -----------------
 DB_NAME = os.getenv("DB_PATH", "otodom_ads.db")
 
-# Conversation states
+# Conversation states (search)
 SELECTING_DISTRICTS, SELECTING_BUDGET, SELECTING_ROOMS = range(3)
+
+# Conversation states (lead)
+LEAD_METHOD, LEAD_PHONE = range(2)
 
 # Pagination
 PAGE_SIZE = 5
@@ -83,6 +96,8 @@ def get_conn() -> sqlite3.Connection:
 def ensure_schema() -> None:
     conn = get_conn()
     cur = conn.cursor()
+
+    # ads table (existing)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS ads (
@@ -101,8 +116,49 @@ def ensure_schema() -> None:
         )
         """
     )
+
+    # leads table (new)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS leads (
+            lead_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ad_id INTEGER,
+            telegram_user_id INTEGER,
+            telegram_username TEXT,
+            full_name TEXT,
+            contact_method TEXT,
+            phone TEXT,
+            status TEXT DEFAULT 'NEW'
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
+
+
+def save_lead(ad_id: int | None, user, contact_method: str, phone: str | None) -> None:
+    try:
+        telegram_user_id = user.id if user else None
+        telegram_username = user.username if user else None
+        full_name = None
+        if user:
+            full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip() or None
+
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO leads (ad_id, telegram_user_id, telegram_username, full_name, contact_method, phone, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'NEW')
+            """,
+            (ad_id, telegram_user_id, telegram_username, full_name, contact_method, phone),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"save_lead error: {e}")
 
 
 def parse_photos(value: Any) -> list[str]:
@@ -125,6 +181,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["budget"] = None
     context.user_data["rooms"] = None
     context.user_data["offset"] = 0
+    context.user_data["selected_ad_id"] = None
 
     keyboard = []
     for district in DISTRICTS:
@@ -307,6 +364,8 @@ async def send_next_page(message, context: ContextTypes.DEFAULT_TYPE) -> None:
             INVISIBLE_TEXT,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё", callback_data="more_results")]]),
         )
+    else:
+        await message.reply_text("Больше вариантов нет. Используйте /start для нового поиска.")
 
 
 async def more_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -353,22 +412,22 @@ async def send_apartment_variant_a(message, apt: dict) -> bool:
     Variant A:
     - 10 photos album (media_group), caption in first photo = description
     - second message: ONLY button “✅ Выбрать объявление”
-    - If no photos -> skip listing
+    - If no photos -> skip listing entirely
     """
-    text = format_apartment(apt)
-
-    # Longer text makes button visually wider on most clients
-    select_markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Выбрать объявление", callback_data=f"select_{apt['ad_id']}")]]
-    )
-
     photos = apt.get("photos", []) or []
     photos = [p for p in photos if isinstance(p, str) and p.startswith("http")]
 
     if len(photos) == 0:
-        return False  # skip no-photo ads completely
+        return False  # skip no-photo ads
 
-    # 1) Send photos + caption
+    text = format_apartment(apt)
+
+    # Wide button: single button in a single row
+    select_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Выбрать объявление", callback_data=f"select_{apt['ad_id']}")]]
+    )
+
+    # 1) Photos + caption
     try:
         if len(photos) >= 2:
             media = []
@@ -382,23 +441,21 @@ async def send_apartment_variant_a(message, apt: dict) -> bool:
             await message.reply_photo(photo=photos[0], caption=text[:1000])
     except Exception as e:
         logger.error(f"Send media error (ad_id={apt.get('ad_id')}): {e}")
-        # Fallback: if media fails, at least show text + button
+        # fallback: show text + button
         await message.reply_text(text)
         await message.reply_text(INVISIBLE_TEXT, reply_markup=select_markup)
         return True
 
-    # 2) Send ONLY button as separate message (safe invisible text)
+    # 2) Button only message (invisible text)
     try:
         await message.reply_text(INVISIBLE_TEXT, reply_markup=select_markup)
     except Exception as e:
         logger.error(f"Send button error (ad_id={apt.get('ad_id')}): {e}")
-        # If button fails, do nothing else (avoid duplicates)
-        return True
 
     return True
 
-# ----------------- "Select" handler -----------------
-async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ----------------- Lead flow -----------------
+async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
@@ -408,7 +465,56 @@ async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ad_id = None
     context.user_data["selected_ad_id"] = ad_id
 
-    await query.message.reply_text("✅ Отлично! Как удобнее с вами связаться?")
+    # Ask contact method
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Telegram", callback_data="lead_tg")],
+            [InlineKeyboardButton("Телефон", callback_data="lead_phone")],
+        ]
+    )
+    await query.message.reply_text("✅ Отлично! Как удобнее с вами связаться?", reply_markup=markup)
+    return LEAD_METHOD
+
+
+async def lead_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    ad_id = context.user_data.get("selected_ad_id")
+    user = query.from_user
+
+    if query.data == "lead_tg":
+        save_lead(ad_id=ad_id, user=user, contact_method="telegram", phone=None)
+        await query.edit_message_text("✅ Принято! Наш консультант свяжется с вами в течение 30 минут.")
+        return ConversationHandler.END
+
+    # phone: request contact button (no manual typing)
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📞 Отправить номер", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await query.edit_message_text("Нажмите кнопку ниже, чтобы отправить номер ⬇️")
+    await query.message.reply_text(INVISIBLE_TEXT, reply_markup=kb)
+    return LEAD_PHONE
+
+
+async def lead_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    contact = update.message.contact
+    if not contact:
+        await update.message.reply_text("❌ Пожалуйста, отправьте номер кнопкой.")
+        return LEAD_PHONE
+
+    ad_id = context.user_data.get("selected_ad_id")
+    user = update.effective_user
+
+    save_lead(ad_id=ad_id, user=user, contact_method="phone", phone=contact.phone_number)
+
+    await update.message.reply_text(
+        "✅ Принято! Наш консультант свяжется с вами в течение 30 минут.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
 
 # ----------------- Cancel -----------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -425,6 +531,7 @@ def main():
 
     app = Application.builder().token(token).build()
 
+    # Search flow
     search_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -436,8 +543,19 @@ def main():
     )
     app.add_handler(search_conv)
 
+    # Pagination
     app.add_handler(CallbackQueryHandler(more_results, pattern=r"^more_results$"))
-    app.add_handler(CallbackQueryHandler(select_apartment, pattern=r"^select_"))
+
+    # Lead flow
+    lead_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(select_apartment, pattern=r"^select_")],
+        states={
+            LEAD_METHOD: [CallbackQueryHandler(lead_method, pattern=r"^lead_tg$|^lead_phone$")],
+            LEAD_PHONE: [MessageHandler(filters.CONTACT, lead_phone)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(lead_conv)
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
