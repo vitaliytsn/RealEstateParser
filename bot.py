@@ -30,8 +30,10 @@ SELECTING_DISTRICTS, SELECTING_BUDGET, SELECTING_ROOMS = range(3)
 # Pagination
 PAGE_SIZE = 5
 
+# Invisible safe text for Telegram messages (NOT empty, but looks empty)
+INVISIBLE_TEXT = "\u2800"  # Braille blank character
+
 # ----------------- UI dictionaries -----------------
-# Sorted by popularity among Ukrainians (approx; adjust any time)
 DISTRICTS = [
     "Mokotów",
     "Wola",
@@ -49,10 +51,8 @@ DISTRICTS = [
     "Praga-Północ",
     "Białołęka",
 ]
-
 DISTRICT_LABELS = {d: d for d in DISTRICTS}
 
-# Budget ranges (new)
 BUDGETS = {
     "0-4000": "До 4000 PLN",
     "4000-5000": "4000-5000 PLN",
@@ -117,7 +117,6 @@ def parse_photos(value: Any) -> list[str]:
     except Exception:
         pass
     return []
-
 
 # ----------------- Bot flow: search steps -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -214,7 +213,6 @@ async def rooms_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_next_page(query.message, context)
     return ConversationHandler.END
 
-
 # ----------------- Search + Pagination -----------------
 def search_apartments(districts: list[str], budget: str, rooms: str | None, offset: int, limit: int) -> list[dict]:
     conn = get_conn()
@@ -304,10 +302,9 @@ async def send_next_page(message, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     context.user_data["offset"] = offset + len(results)
 
-    # show "more" button only if we sent something (and generally always allow next page)
     if sent_any:
         await message.reply_text(
-            " ",
+            INVISIBLE_TEXT,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё", callback_data="more_results")]]),
         )
 
@@ -316,7 +313,6 @@ async def more_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     await query.answer()
     await send_next_page(query.message, context)
-
 
 # ----------------- Sending apartment: Variant A -----------------
 def format_apartment(apt: dict) -> str:
@@ -355,52 +351,51 @@ def format_apartment(apt: dict) -> str:
 async def send_apartment_variant_a(message, apt: dict) -> bool:
     """
     Variant A:
-    - Only listings with photos are shown
-    - If 2+ photos: send album (up to 10) with caption on first photo, THEN second message with ONLY button
-    - If 1 photo: send photo with caption, THEN second message with ONLY button
-    - If 0 photos: skip listing entirely (return False)
+    - 10 photos album (media_group), caption in first photo = description
+    - second message: ONLY button “✅ Выбрать объявление”
+    - If no photos -> skip listing
     """
     text = format_apartment(apt)
 
-    # Make button visually "wider" by longer label
-    select_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Выбрать объявление", callback_data=f"select_{apt['ad_id']}")]
-    ])
+    # Longer text makes button visually wider on most clients
+    select_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Выбрать объявление", callback_data=f"select_{apt['ad_id']}")]]
+    )
 
     photos = apt.get("photos", []) or []
     photos = [p for p in photos if isinstance(p, str) and p.startswith("http")]
 
-    # Skip no-photo listings completely
     if len(photos) == 0:
-        return False
+        return False  # skip no-photo ads completely
 
+    # 1) Send photos + caption
     try:
         if len(photos) >= 2:
             media = []
-            for i, url in enumerate(photos[:10]):  # telegram limit = 10
+            for i, url in enumerate(photos[:10]):
                 if i == 0:
                     media.append(InputMediaPhoto(media=url, caption=text[:1000]))
                 else:
                     media.append(InputMediaPhoto(media=url))
-
             await message.reply_media_group(media)
-            # Second message: ONLY button
-            await message.reply_text(" ", reply_markup=select_markup)
-            return True
-
-        # len == 1
-        await message.reply_photo(photo=photos[0], caption=text[:1000])
-        # Second message: ONLY button
-        await message.reply_text(" ", reply_markup=select_markup)
-        return True
-
+        else:
+            await message.reply_photo(photo=photos[0], caption=text[:1000])
     except Exception as e:
-        logger.error(f"Send apartment error (ad_id={apt.get('ad_id')}): {e}")
-        # Fallback: still show something with button, but you said no-no-photo only.
+        logger.error(f"Send media error (ad_id={apt.get('ad_id')}): {e}")
+        # Fallback: if media fails, at least show text + button
         await message.reply_text(text)
-        await message.reply_text(" ", reply_markup=select_markup)
+        await message.reply_text(INVISIBLE_TEXT, reply_markup=select_markup)
         return True
 
+    # 2) Send ONLY button as separate message (safe invisible text)
+    try:
+        await message.reply_text(INVISIBLE_TEXT, reply_markup=select_markup)
+    except Exception as e:
+        logger.error(f"Send button error (ad_id={apt.get('ad_id')}): {e}")
+        # If button fails, do nothing else (avoid duplicates)
+        return True
+
+    return True
 
 # ----------------- "Select" handler -----------------
 async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -415,12 +410,10 @@ async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await query.message.reply_text("✅ Отлично! Как удобнее с вами связаться?")
 
-
 # ----------------- Cancel -----------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Поиск отменен. Используйте /start для нового поиска.")
     return ConversationHandler.END
-
 
 # ----------------- Main -----------------
 def main():
@@ -443,15 +436,11 @@ def main():
     )
     app.add_handler(search_conv)
 
-    # Pagination
     app.add_handler(CallbackQueryHandler(more_results, pattern=r"^more_results$"))
-
-    # Select
     app.add_handler(CallbackQueryHandler(select_apartment, pattern=r"^select_"))
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
