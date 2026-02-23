@@ -362,7 +362,7 @@ async def send_next_page(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     if sent_any:
         # CHANGED: use visible text so inline keyboard ALWAYS appears
         await message.reply_text(
-            "⬇️",
+            "Если не нешел могу",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё", callback_data="more_results")]]),
         )
     else:
@@ -442,12 +442,12 @@ async def send_apartment_variant_a(message, apt: dict) -> bool:
     except Exception as e:
         logger.error(f"Send media error (ad_id={apt.get('ad_id')}): {e}")
         await message.reply_text(text)
-        await message.reply_text("✅", reply_markup=select_markup)
+        await message.reply_text("Нравится?", reply_markup=select_markup)
         return True
 
     # 2) CHANGED: use visible text so inline keyboard ALWAYS appears
     try:
-        await message.reply_text("✅", reply_markup=select_markup)
+        await message.reply_text("Нравится?", reply_markup=select_markup)
     except Exception as e:
         logger.error(f"Send button error (ad_id={apt.get('ad_id')}): {e}")
 
@@ -470,7 +470,12 @@ async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             [InlineKeyboardButton("Телефон", callback_data="lead_phone")],
         ]
     )
-    await query.message.reply_text("✅ Отлично! Как удобнее с вами связаться?", reply_markup=markup)
+
+    # IMPORTANT: edit the SAME message where the Select button was
+    await query.edit_message_text(
+        "Отлично! Как удобнее с вами связаться?",
+        reply_markup=markup,
+    )
     return LEAD_METHOD
 
 
@@ -491,8 +496,7 @@ async def lead_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await query.edit_message_text("Нажмите кнопку ниже, чтобы отправить номер ⬇️")
-    await query.message.reply_text(INVISIBLE_TEXT, reply_markup=kb)
+    await query.message.reply_text("📞 Нажмите кнопку «Отправить номер» ниже 👇", reply_markup=kb)
     return LEAD_PHONE
 
 
