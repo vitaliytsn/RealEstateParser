@@ -41,7 +41,7 @@ SELECTING_DISTRICTS, SELECTING_BUDGET, SELECTING_ROOMS = range(3)
 LEAD_METHOD, LEAD_PHONE = range(2)
 
 # Pagination
-PAGE_SIZE = 5
+PAGE_SIZE = 3
 
 # Invisible safe text for Telegram messages (NOT empty, but looks empty)
 INVISIBLE_TEXT = "\u2800"  # Braille blank character
@@ -174,6 +174,29 @@ def parse_photos(value: Any) -> list[str]:
         pass
     return []
 
+
+# ----------------- NEW: districts keyboard (2 columns + one big continue) -----------------
+def build_districts_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+    keyboard: list[list[InlineKeyboardButton]] = []
+
+    for i in range(0, len(DISTRICTS), 2):
+        row: list[InlineKeyboardButton] = []
+
+        d1 = DISTRICTS[i]
+        t1 = ("✅ " if d1 in selected else "") + DISTRICT_LABELS[d1]
+        row.append(InlineKeyboardButton(t1, callback_data=f"district_{d1}"))
+
+        if i + 1 < len(DISTRICTS):
+            d2 = DISTRICTS[i + 1]
+            t2 = ("✅ " if d2 in selected else "") + DISTRICT_LABELS[d2]
+            row.append(InlineKeyboardButton(t2, callback_data=f"district_{d2}"))
+
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("🚀 ПРОДОЛЖИТЬ", callback_data="districts_done")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 # ----------------- Bot flow: search steps -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -183,15 +206,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["offset"] = 0
     context.user_data["selected_ad_id"] = None
 
-    keyboard = []
-    for district in DISTRICTS:
-        keyboard.append([InlineKeyboardButton(DISTRICT_LABELS[district], callback_data=f"district_{district}")])
-    keyboard.append([InlineKeyboardButton("✅ Готово, продолжить", callback_data="districts_done")])
-
     await update.message.reply_text(
         "🏠 Добро пожаловать в поиск квартир в Варшаве!\n\n"
         "Выберите интересующие вас районы (можно несколько):",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=build_districts_keyboard(context.user_data["selected_districts"]),
     )
     return SELECTING_DISTRICTS
 
@@ -226,13 +244,10 @@ async def district_selection(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     context.user_data["selected_districts"] = selected
 
-    keyboard = []
-    for dist in DISTRICTS:
-        prefix = "✅ " if dist in selected else ""
-        keyboard.append([InlineKeyboardButton(f"{prefix}{DISTRICT_LABELS[dist]}", callback_data=f"district_{dist}")])
-    keyboard.append([InlineKeyboardButton("✅ Готово, продолжить", callback_data="districts_done")])
-
-    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    # IMPORTANT: keep 2-column layout after every click
+    await query.edit_message_reply_markup(
+        reply_markup=build_districts_keyboard(selected)
+    )
     return SELECTING_DISTRICTS
 
 
@@ -269,6 +284,7 @@ async def rooms_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await send_next_page(query.message, context)
     return ConversationHandler.END
+
 
 # ----------------- Search + Pagination -----------------
 def search_apartments(districts: list[str], budget: str, rooms: str | None, offset: int, limit: int) -> list[dict]:
@@ -360,9 +376,8 @@ async def send_next_page(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["offset"] = offset + len(results)
 
     if sent_any:
-        # CHANGED: use visible text so inline keyboard ALWAYS appears
         await message.reply_text(
-            "Если не нешел могу",
+            "Хочешь больше 👇",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Показать ещё", callback_data="more_results")]]),
         )
     else:
@@ -373,6 +388,7 @@ async def more_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     await query.answer()
     await send_next_page(query.message, context)
+
 
 # ----------------- Sending apartment: Variant A -----------------
 def format_apartment(apt: dict) -> str:
@@ -409,12 +425,6 @@ def format_apartment(apt: dict) -> str:
 
 
 async def send_apartment_variant_a(message, apt: dict) -> bool:
-    """
-    Variant A:
-    - 10 photos album (media_group), caption in first photo = description
-    - second message: ONLY button “✅ Выбрать объявление”
-    - If no photos -> skip listing entirely
-    """
     photos = apt.get("photos", []) or []
     photos = [p for p in photos if isinstance(p, str) and p.startswith("http")]
 
@@ -427,7 +437,6 @@ async def send_apartment_variant_a(message, apt: dict) -> bool:
         [[InlineKeyboardButton("✅ Выбрать объявление", callback_data=f"select_{apt['ad_id']}")]]
     )
 
-    # 1) Photos + caption
     try:
         if len(photos) >= 2:
             media = []
@@ -442,16 +451,16 @@ async def send_apartment_variant_a(message, apt: dict) -> bool:
     except Exception as e:
         logger.error(f"Send media error (ad_id={apt.get('ad_id')}): {e}")
         await message.reply_text(text)
-        await message.reply_text("Нравится?", reply_markup=select_markup)
+        await message.reply_text("Для просмотра 👇", reply_markup=select_markup)
         return True
 
-    # 2) CHANGED: use visible text so inline keyboard ALWAYS appears
     try:
-        await message.reply_text("Нравится?", reply_markup=select_markup)
+        await message.reply_text("Для просмотра 👇", reply_markup=select_markup)
     except Exception as e:
         logger.error(f"Send button error (ad_id={apt.get('ad_id')}): {e}")
 
     return True
+
 
 # ----------------- Lead flow -----------------
 async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -471,7 +480,6 @@ async def select_apartment(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ]
     )
 
-    # IMPORTANT: edit the SAME message where the Select button was
     await query.edit_message_text(
         "Отлично! Как удобнее с вами связаться?",
         reply_markup=markup,
@@ -517,10 +525,12 @@ async def lead_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ConversationHandler.END
 
+
 # ----------------- Cancel -----------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Поиск отменен. Используйте /start для нового поиска.")
     return ConversationHandler.END
+
 
 # ----------------- Main -----------------
 def main():
@@ -557,6 +567,7 @@ def main():
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
