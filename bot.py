@@ -78,8 +78,7 @@ ROOMS_OPTIONS = {
     "1": "1 комната",
     "2": "2 комнаты",
     "3": "3 комнаты",
-    "4": "4 комнаты",
-    "5+": "5+ комнат",
+    "3+": "3+ комнаты"
 }
 
 # ----------------- DB helpers -----------------
@@ -206,9 +205,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["offset"] = 0
     context.user_data["selected_ad_id"] = None
 
+    text = (
+        "Привет! 👋\n\n"
+        "Я бот-хранитель объявлений 🏡\n\n"
+        "По твоим критериям соберу актуальные варианты со всех популярных порталов (Otodom, OLX и т.д.) 🔎\n\n"
+        "Просто выбери интересующее тебя объявление и менеджер поможет тебе в коммуникации с собственником и с оформлением документов.\n\n"
+        "Давай не тянуть время и перейдём к делу! 🚀\n\n"
+        "Выбери интересующие тебя районы (можно несколько):"
+    )
+
     await update.message.reply_text(
-        "🏠 Добро пожаловать в поиск квартир в Варшаве!\n\n"
-        "Выберите интересующие вас районы (можно несколько):",
+        text,
         reply_markup=build_districts_keyboard(context.user_data["selected_districts"]),
     )
     return SELECTING_DISTRICTS
@@ -261,10 +268,10 @@ async def budget_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     keyboard = []
     for k, label in ROOMS_OPTIONS.items():
         keyboard.append([InlineKeyboardButton(label, callback_data=f"rooms_{k}")])
-    keyboard.append([InlineKeyboardButton("Любое количество комнат", callback_data="rooms_any")])
+    keyboard.append([InlineKeyboardButton("Любое к-во комнат", callback_data="rooms_any")])
 
     await query.edit_message_text(
-        f"✅ Бюджет: {BUDGETS[budget]}\n\n🛏️ Выберите количество комнат:",
+        f"✅ Бюджет: {BUDGETS[budget]}\n\n🛏️ Выберите к-во комнат:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return SELECTING_ROOMS

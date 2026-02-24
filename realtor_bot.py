@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import logging
-from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -69,7 +68,6 @@ def ensure_realtor_schema() -> None:
     conn = get_conn()
     cur = conn.cursor()
 
-    # leads must exist (created in client bot), but we protect anyway
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS leads (
@@ -86,7 +84,6 @@ def ensure_realtor_schema() -> None:
         """
     )
 
-    # Add missing columns (safe)
     alters: List[str] = []
     if not _table_has_column(conn, "leads", "notified"):
         alters.append("ALTER TABLE leads ADD COLUMN notified INTEGER DEFAULT 0")
@@ -212,7 +209,6 @@ def unclaim_lead(lead_id: int) -> None:
 
 
 def get_ad_summary(ad_id: Optional[int]) -> Dict[str, Any]:
-    """Fetch a short ad info from ads table, if exists."""
     if not ad_id:
         return {}
     conn = get_conn()
@@ -239,7 +235,7 @@ def lead_text(lead: sqlite3.Row) -> str:
     lead_id = lead["lead_id"]
     ad_id = lead["ad_id"]
     created_at = lead["created_at"]
-    status = lead.get("status") if isinstance(lead, dict) else lead["status"]
+    status = lead["status"]
     status_label = STATUS_LABELS.get(status, status)
 
     tg_username = lead["telegram_username"] or ""
@@ -252,7 +248,7 @@ def lead_text(lead: sqlite3.Row) -> str:
     claimed = ""
     if lead["claimed_by_id"]:
         who = lead["claimed_by_username"] or str(lead["claimed_by_id"])
-        claimed = f"\n👤 Взял: @{who}"
+        claimed = f"\n👤 Взял: @{who}" if lead["claimed_by_username"] else f"\n👤 Взял: {who}"
 
     ad = get_ad_summary(ad_id)
     ad_block = ""
@@ -297,19 +293,15 @@ def lead_text(lead: sqlite3.Row) -> str:
 
 def lead_keyboard(lead: sqlite3.Row) -> InlineKeyboardMarkup:
     lead_id = int(lead["lead_id"])
-    status = lead["status"] or STATUS_NEW
     claimed_by_id = lead["claimed_by_id"]
 
     buttons = []
 
-    # Claim / Unclaim
     if not claimed_by_id:
         buttons.append([InlineKeyboardButton("🧲 Забрать", callback_data=f"claim:{lead_id}")])
     else:
         buttons.append([InlineKeyboardButton("↩️ Освободить", callback_data=f"unclaim:{lead_id}")])
 
-    # Status buttons (only if claimed OR allow everyone? обычно только если забрал)
-    # Тут сделаем: менять статусы может только тот, кто забрал.
     buttons.append([
         InlineKeyboardButton("✅ Связался", callback_data=f"status:{lead_id}:{STATUS_CONTACTED}"),
         InlineKeyboardButton("📅 Просмотр", callback_data=f"status:{lead_id}:{STATUS_VIEWING_SET}"),
@@ -344,7 +336,6 @@ async def refresh_lead_message(app: Application, lead_id: int) -> None:
             disable_web_page_preview=True,
         )
     except Exception as e:
-        # Editing can fail if message is too old or changed. Fallback: send a new message.
         logger.warning(f"edit_message_text failed for lead {lead_id}: {e}")
         try:
             sent = await app.bot.send_message(
@@ -353,7 +344,6 @@ async def refresh_lead_message(app: Application, lead_id: int) -> None:
                 reply_markup=lead_keyboard(lead),
                 disable_web_page_preview=True,
             )
-            # overwrite stored msg_id
             conn = get_conn()
             cur = conn.cursor()
             cur.execute(
@@ -402,12 +392,46 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _display_user(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+    name = (user.full_name or "").strip()
+    if name:
+        return name
+    return str(user.id)
+
+
+async def _send_history_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    lead_id: int,
+    text: str,
+) -> None:
+    lead = get_lead(lead_id)
+    if not lead:
+        return
+
+    chat_id = lead["realtor_chat_id"] or REALTOR_CHAT_ID
+    msg_id = lead["realtor_msg_id"]
+
+    try:
+        if msg_id:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_to_message_id=msg_id,
+                allow_sending_without_reply=True,
+            )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        logger.warning(f"history message failed for lead {lead_id}: {e}")
+
+
 async def on_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
 
-    parts = q.data.split(":")
-    lead_id = int(parts[1])
+    lead_id = int(q.data.split(":")[1])
 
     lead = get_lead(lead_id)
     if not lead:
@@ -420,7 +444,12 @@ async def on_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user = q.from_user
     claim_lead(lead_id, user.id, user.username)
+
     await refresh_lead_message(context.application, lead_id)
+
+    who = _display_user(user)
+    await _send_history_message(context, lead_id, f"🧲 Лид #{lead_id} забрал: {who}")
+
     await q.answer("Забрал ✅", show_alert=False)
 
 
@@ -440,7 +469,12 @@ async def on_unclaim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     unclaim_lead(lead_id)
+
     await refresh_lead_message(context.application, lead_id)
+
+    who = _display_user(user)
+    await _send_history_message(context, lead_id, f"↩️ Лид #{lead_id} освободил: {who}")
+
     await q.answer("Освободил ↩️", show_alert=False)
 
 
@@ -471,6 +505,16 @@ async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     update_lead_status(lead_id, status)
     await refresh_lead_message(context.application, lead_id)
+
+    # ✅ NEW: history only for DONE
+    if status == STATUS_DONE:
+        who = _display_user(user)
+        await _send_history_message(
+            context,
+            lead_id,
+            f"🏁 Лид #{lead_id} закрыт ✅ — {who}",
+        )
+
     await q.answer("Обновил статус ✅", show_alert=False)
 
 
@@ -488,9 +532,13 @@ def main():
 
     app.add_handler(CallbackQueryHandler(on_claim, pattern=r"^claim:\d+$"))
     app.add_handler(CallbackQueryHandler(on_unclaim, pattern=r"^unclaim:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_status, pattern=r"^status:\d+:(NEW|IN_PROGRESS|CONTACTED|VIEWING_SET|NOT_ACTUAL|CLIENT_REFUSED|DONE)$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_status,
+            pattern=r"^status:\d+:(NEW|IN_PROGRESS|CONTACTED|VIEWING_SET|NOT_ACTUAL|CLIENT_REFUSED|DONE)$",
+        )
+    )
 
-    # Polling job for new leads
     app.job_queue.run_repeating(poll_new_leads, interval=REALTOR_POLL_INTERVAL, first=5)
 
     logger.info("Realtor bot started!")
